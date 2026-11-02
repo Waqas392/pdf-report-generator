@@ -1,8 +1,10 @@
 """Stages 0, 4, 5: the API. Pipeline runs inside the endpoint (no background jobs)."""
+import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 
 from db import get_conn
@@ -11,6 +13,7 @@ from report_data import get_report_data
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 app = FastAPI(title="PDF report generator")
+_generate_lock = threading.Lock()  # makes check-then-create atomic for rapid double requests
 
 
 def _record(row) -> dict:
@@ -23,25 +26,36 @@ def health():
 
 
 @app.post("/reports", status_code=201)
-def create_report():
-    conn = get_conn()
-    try:
-        cur = conn.execute("INSERT INTO reports (created_at) VALUES (?)",
-                           (datetime.now().isoformat(timespec="seconds"),))
-        report_id = cur.lastrowid
-        path = REPORTS_DIR / f"{report_id}.pdf"
+def create_report(response: Response, body: Optional[dict] = Body(default=None)):
+    force = bool(body and body.get("force"))
+    today = datetime.now().date().isoformat()
+    with _generate_lock:
+        conn = get_conn()
         try:
-            render_pdf(get_report_data(), path)
-        except Exception:
-            conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+            if not force:  # Stage 5: idempotency
+                existing = conn.execute(
+                    "SELECT * FROM reports WHERE created_at LIKE ? AND path IS NOT NULL "
+                    "ORDER BY id DESC LIMIT 1", (today + "%",)).fetchone()
+                if existing:
+                    response.status_code = 200
+                    return _record(existing)
+            cur = conn.execute("INSERT INTO reports (created_at) VALUES (?)",
+                               (datetime.now().isoformat(timespec="seconds"),))
+            report_id = cur.lastrowid
+            path = REPORTS_DIR / f"{report_id}.pdf"
+            try:
+                render_pdf(get_report_data(), path)       # query -> render -> store
+            except Exception:
+                conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+                conn.commit()
+                raise
+            conn.execute("UPDATE reports SET path = ? WHERE id = ?", (str(path), report_id))
             conn.commit()
-            raise
-        conn.execute("UPDATE reports SET path = ? WHERE id = ?", (str(path), report_id))
-        conn.commit()
-        row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-        return _record(row)
-    finally:
-        conn.close()
+            return _record(conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone())
+        finally:
+            conn.close()
+
+
 @app.get("/reports")
 def list_reports():
     conn = get_conn()
